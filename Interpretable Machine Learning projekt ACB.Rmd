@@ -1,0 +1,526 @@
+---
+title: "Interpretable Machine Learning projekt ACB"
+author: "Anton Bendsen"
+date: "2026-04-30"
+output: html_document
+
+NOTE: Depends om the amount of cores.
+
+```{r}
+library(future)
+future::plan(multisession, workers = 8)
+```
+
+
+
+```{r}
+library(mlr3verse)
+```
+
+
+```{r}
+#install.packages("CASdatasets", repos = "http://cas.uqam.ca/pub/", type="source")
+```
+
+
+
+```{r}
+library(CASdatasets)
+
+data(freMPL1) 
+
+data(freMPL2) 
+data(freMPL3) 
+
+data(freMPL4)
+
+freMPL3 <- subset( freMPL3 , select = -DeducType )  
+
+freMPL4 <- subset( freMPL4 , select = -DeducType )  
+
+freMPL <- rbind(freMPL1,freMPL2,freMPL3,freMPL4)
+
+
+```
+
+alternative: (has X col.)
+```{r}
+#freMPLabsalon <- read.csv("~/Downloads/freMPL.csv")
+```
+
+
+We remove the col "RecordEnd": and altså claim indicator.
+
+```{r}
+freMPL$HasRecordEnd <- ifelse(is.na(freMPL$RecordEnd), 0, 1)
+
+freMPLnoUNA <- subset(freMPL, select = -RecordEnd)
+freMPLnoUNA <- subset(freMPLnoUNA, select = -ClaimInd)
+freMPLnoUNA$AmountExposure=freMPLnoUNA$ClaimAmount/freMPLnoUNA$Exposure
+
+```
+
+We see that we have no NA's now:
+```{r}
+nrow(freMPLnoUNA)
+nrow(na.omit(freMPLnoUNA))
+```
+
+
+We see that much of the data are dublicates. This seem very unrealistic. We therefore remove all
+```{r}
+unique(freMPLnoUNA)
+```
+
+```{r}
+freMPLnoUNA<-unique(freMPLnoUNA)
+```
+
+
+To handle SocialCategories:
+
+```{r}
+library(dplyr)
+
+freMPLnoUNA$SocioGroup <- dplyr::case_when(
+  grepl("^CSP1", freMPLnoUNA$SocioCateg) ~ "Farmer",
+  grepl("^CSP2", freMPLnoUNA$SocioCateg) ~ "SelfEmp",
+  grepl("^CSP3", freMPLnoUNA$SocioCateg) ~ "Executive",
+  grepl("^CSP4", freMPLnoUNA$SocioCateg) ~ "Intermediate",
+  grepl("^CSP5", freMPLnoUNA$SocioCateg) ~ "Employee",
+  grepl("^CSP6", freMPLnoUNA$SocioCateg) ~ "Worker",
+  grepl("^CSP7", freMPLnoUNA$SocioCateg) ~ "Retired",
+  grepl("^CSP8", freMPLnoUNA$SocioCateg) ~ "Inactive",
+  TRUE ~ "Unknown"
+)
+
+table(freMPLnoUNA$SocioGroup)
+
+freMPLnoUNA$SocioGroup<-as.factor(freMPLnoUNA$SocioGroup)
+```
+from https://fr.wikipedia.org/wiki/Professions_et_cat%C3%A9gories_socioprofessionnelles_en_France
+
+
+```{r}
+freMPLnoUNA <- subset(freMPLnoUNA, select = -SocioCateg)
+
+summary(freMPLnoUNA)
+```
+
+
+
+
+```{r}
+freMPLnoUNA$RecordBeg <- as.numeric(freMPLnoUNA$RecordBeg)-12418 #12418=1/1-2004, thus RecordBeg will be days after 1/1-2004.
+```
+
+If the ClaimAmount is negative we set it to zero:
+
+```{r}
+freMPLnoUNA$AmountExposure[freMPLnoUNA$AmountExposure < 0] <- 0
+
+freMPLnoUNA<-subset(freMPLnoUNA,select = -ClaimAmount)
+
+
+```
+
+
+
+
+# make task
+```{r}
+claim_task=as_task_regr(freMPLnoUNA,id="claim_task",target="AmountExposure",weight = freMPLnoUNA$Exposure)
+
+
+claim_task$select(
+  setdiff(
+    claim_task$feature_names,
+    "Exposure"
+  )
+)
+
+```
+
+We dont remove then.
+
+Fit first model:
+```{r}
+graph1 <- 
+  po("encode") %>>%
+  po("scale") %>>%
+  lrn("regr.lm")
+
+graph1_learner <- as_learner(graph1)
+graph1$plot(horizontal = TRUE)
+
+```
+
+We split to have a validation set:
+
+```{r}
+set.seed(123)
+splits = partition(claim_task,ratio=0.8)
+
+task_train = claim_task$clone()$filter(splits$train)
+task_test  = claim_task$clone()$filter(splits$test)
+```
+
+```{r}
+#graph1_learner$train(claim_task,row_ids=splits$train)
+
+graph1_learner$train(task_train)
+
+graph1_learner$model
+```
+
+
+```{r}
+#pred = graph1_learner$predict(claim_task, row_ids = splits$test)
+pred = graph1_learner$predict(task_test)
+
+
+pred
+
+pred$score(msr("regr.mse"))
+pred$score(msr("regr.mae"))
+
+```
+
+The above is for a single fold. We would like to do CV to get stronger results:
+
+```{r}
+resampling = rsmp("cv", folds = 10)
+
+rr_graph1 = resample(
+  task_train,
+  graph1_learner,
+  resampling
+)
+
+rr_graph1$aggregate(msr("regr.mse"))
+rr_graph1$aggregate(msr("regr.mae"))
+```
+
+If we would see info about the model:
+```{r}
+graph1_learner$model$regr.lm$model
+
+rr_graph1$model$regr.lm$model
+```
+
+
+
+
+
+Compare to featureless:
+
+```{r} 
+##claim_task$set_col_roles("Exposure", roles = "weights_learner") (virker ikke)
+
+graphfeatureless <- 
+  po("encode") %>>%
+#  po("scale") %>>%
+  lrn("regr.featureless")
+
+graphfeatureless_learner <- as_learner(graphfeatureless)
+
+graphfeatureless_learner$train(claim_task,row_ids=splits$train)
+
+#predfeatureless = graphfeatureless_learner$predict(claim_task, row_ids = splits$test)
+predfeatureless = graphfeatureless_learner$predict(task_test)
+predfeatureless
+predfeatureless$score(msr("regr.mse"))
+predfeatureless$score(msr("regr.mae"))
+
+
+
+graphfeatureless_learner$predict(task_test)
+```
+
+
+With CV:
+```{r}
+set.seed(123)
+
+rr_featureless = resample(
+  task_train,
+  graphfeatureless_learner,
+  resampling
+)
+
+rr_featureless$aggregate(msr("regr.mse"))
+rr_featureless$aggregate(msr("regr.mae"))
+```
+
+
+unique(freMPL2)
+
+To validate (only as the very last):
+```{r}
+pred = graphfeatureless_learner$predict(task_test)
+pred$score(msr("regr.mse"))
+```
+
+
+
+#Lasso and Ridge regression:
+
+
+```{r}
+LassoGraph <- 
+  po("encode") %>>%
+  po("scale") %>>%
+  lrn("regr.glmnet",id="lasso", alpha=1,lambda=to_tune(p_dbl(log(1e-5), log(1e1), trafo = exp)))
+
+RidgeGraph <- 
+  po("encode") %>>%
+  po("scale") %>>%
+  lrn("regr.glmnet",id="ridge", alpha=0,lambda=to_tune(p_dbl(log(1e-5), log(1e1), trafo = exp)))
+
+ElasticNetGraph <- 
+  po("encode") %>>%
+  po("scale") %>>%
+  lrn("regr.glmnet",id="elasticnet", alpha = to_tune(0, 1),lambda=to_tune(p_dbl(log(1e-5), log(1e1), trafo = exp)))
+
+
+LassoLearner<-as_learner(LassoGraph)
+RidgeLearner<-as_learner(RidgeGraph)
+ElasticNetLearner<-as_learner(ElasticNetGraph)
+
+
+```
+
+Use autotuner:
+
+```{r}
+at_Lasso = auto_tuner(
+  tuner = tnr("random_search", batch_size = 20),
+  learner = LassoLearner,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("regr.mse"),
+  terminator = trm("evals", n_evals = 50)
+)
+
+at_Ridge = auto_tuner(
+  tuner = tnr("random_search", batch_size = 20),
+  learner = RidgeLearner,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("regr.mse"),
+  terminator = trm("evals", n_evals = 50)
+)
+
+at_ElasticNet = auto_tuner(
+  tuner = tnr("random_search", batch_size = 20),
+  learner = ElasticNetLearner,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("regr.mse"),
+  terminator = trm("evals", n_evals = 50)
+)
+```
+
+```{r}
+learners=list(graph1,graphfeatureless,at_Lasso,at_Ridge,at_ElasticNet)
+
+design=benchmark_grid(task=claim_task,learners=learners,resamplings = rsmp("cv",folds=5))
+```
+
+
+```{r}
+results_benchmark<-benchmark(design)
+```
+
+
+```{r}
+results_benchmark$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+```
+
+
+# WE now try with splines:
+
+```{r}
+SplinesLearner<-as_learner(lrn(
+    "regr.gam",
+    formula=AmountExposure ~ s(BonusMalus, bs="cr") +s(LicAge,bs="cr")+s(RecordBeg,bs="cr")+VehAge+Gender+MariStat+VehUsage+s(DrivAge,bs="cr")+HasKmLimit+VehBody+VehPrice+VehEngine+VehEnergy+VehMaxSpeed+VehClass+s(RiskVar,bs="cr")+Garage+HasRecordEnd+SocioGroup ,
+    gamma = to_tune(1,1e3,logscale=TRUE),
+    select = to_tune(c(TRUE, FALSE)),
+    drop.unused.levels=FALSE # Default is TRUE, but this may cause errors if splits are unlucky
+  ))
+
+
+at_Splines = auto_tuner(
+  tnr("random_search", batch_size=20),
+  SplinesLearner,
+  measure = msr("regr.mse"),
+  resampling = rsmp("cv", folds=5),
+  terminator = trm("evals", n_evals=50)
+)
+
+
+learner_spline=list(at_Splines)
+
+design_splines=benchmark_grid(task=claim_task,learners=learner_spline,resamplings = rsmp("cv",folds=5))
+
+results_splines<-benchmark(design_splines)
+
+results_splines$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+```
+
+
+To get beta-coef we train on one set:
+```{r}
+at_Splines$train(claim_task)
+
+best<-at_Splines$tuning_result$learner_param_vals[[1]]
+
+final_gam <- as_learner(po("encode") %>>%
+  po("scale") %>>%lrn(
+  "regr.gam",
+  formula = AmountExposure ~ s(BonusMalus, bs="cr") +
+    s(LicAge,bs="cr") +
+    s(RecordBeg,bs="cr") +
+    VehAge + Gender + MariStat + VehUsage +
+    s(DrivAge,bs="cr") + HasKmLimit + VehBody +
+    VehPrice + VehEngine + VehEnergy + VehMaxSpeed +
+    VehClass + s(RiskVar,bs="cr") + Garage +
+    HasRecordEnd + SocioGroup,
+  gamma = best$gamma,
+  select = best$select,
+  drop.unused.levels = FALSE
+))
+
+final_gam$train(claim_task)
+
+summary(final_gam$model)
+```
+
+
+#We make a tree:
+```{r}
+TreeLrn <- lrn("regr.rpart",id="Tree",cp=0,predict_type="response") #CP=0 means no pruning
+
+```
+
+```{r}
+learner_tree=list(as_learner(TreeLrn))
+
+design_tree=benchmark_grid(task=claim_task,learners=learner_tree,resamplings = rsmp("cv",folds=5))
+
+results_tree<-benchmark(design_tree)
+
+results_tree$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+```
+We plot the tree
+
+```{r}
+TreeLrn$train(claim_task)
+
+tree_model <- TreeLrn$graph_model$model$rpart$model
+
+TreeLrn$model
+
+rpart::printcp(TreeLrn)
+
+
+
+```
+
+```{r}
+sum(TreeLrn$model$frame$var != "<leaf>")
+```
+Vi får altså over 2200 blade.
+
+det er lort.
+
+We add some cp to make it smaller:
+
+
+```{r}
+TreeLrn2 <- lrn("regr.rpart",id="Tree",cp=0.01,predict_type="response") #CP=0 means no pruning
+TreeLrn2$train(claim_task)
+TreeLrn2$model
+
+```
+We see men make losses of 227€ where women make losses of 160.000€...
+
+
+```{r}
+TreeLrn3 <- lrn("regr.rpart",id="Tree",cp=0.001,predict_type="response") #CP=0 means no pruning
+TreeLrn3$train(claim_task)
+TreeLrn3$model
+```
+
+```{r}
+TreeTune <- lrn("regr.rpart",id="Tree",predict_type="response",cp = to_tune(p_dbl(1e-4, 0.05, logscale = TRUE))) #CP=0 means no pruning
+
+TreeLrnTune=as_learner(TreeTune)
+
+at_TreeTune = auto_tuner(
+  tuner = tnr("grid_search", resolution = 30),
+  learner = TreeLrnTune,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("regr.mse"),
+  terminator = trm("none")
+)
+
+learner_Tree=list(at_TreeTune)
+design_Tree=benchmark_grid(task=claim_task,learners=learner_Tree,resamplings = rsmp("cv",folds=5))
+results_benchmark_Tree<-benchmark(design_Tree)
+
+```
+
+```{r}
+results_benchmark_Tree$aggregate(list(msr("regr.mse"),msr("regr.mae")))
+
+```
+
+
+
+
+
+# Overview of the data set:
+
+
+```{r}
+barplot(proportions(table(5*round(freMPLnoUNA$LicAge/60), freMPLnoUNA$RiskVar), 2), beside = FALSE, 
+        col=rainbow(17), xlab="RiskVar", main="LicAge (year)", xlim=c(1, 30))
+legend("right", fill=rainbow(17), legend=sort(unique(5*round(freMPLnoUNA$LicAge/60))), cex=0.8)
+```
+
+```{r}
+lic_age_group <- 5 * round(freMPLnoUNA$LicAge / 60)
+n <- length(unique(lic_age_group))
+
+barplot(
+  proportions(table(lic_age_group, freMPLnoUNA$RiskVar), 2),
+  beside = FALSE,
+  col = rainbow(n),
+  xlab = "RiskVar",
+  main = "LicAge (year)"
+)
+
+legend(
+  "right",
+  fill = rainbow(n),
+  legend = sort(unique(lic_age_group)),
+  cex = 0.8
+)
+```
+
+
+
+Only looking at the data where we have claims:
+
+```{r}
+claim_data<-subset(freMPLnoUNA, ClaimAmount>0)
+
+```
+
+
+
+
+
+
+
+
+
